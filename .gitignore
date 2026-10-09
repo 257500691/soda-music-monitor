@@ -1,0 +1,21 @@
+# 运行时生成的缓存索引，含本机绝对路径，不要提交
+cache_index.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+
+# 截图临时文件
+_tmp.png
+_full*.png
+_now.png
