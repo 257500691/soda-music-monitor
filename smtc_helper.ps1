@@ -4,6 +4,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$OutPath,
     [string]$CoverPath = "",
+    [string]$CommandPath = "",
     [int]$IntervalMs = 700,
     [switch]$Once
 )
@@ -98,6 +99,10 @@ catch {
 [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime] | Out-Null
 $smtcType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties, Windows.Media.Control, ContentType = WindowsRuntime]
 $rasType = [Windows.Storage.Streams.IRandomAccessStreamWithContentType, Windows.Storage.Streams, ContentType = WindowsRuntime]
+$randomStreamType = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+$inputToStream = ([System.IO.WindowsRuntimeStreamExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsStreamForRead' -and $_.GetParameters().Count -eq 1
+})[0]
 
 try {
     $manager = Await ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
@@ -149,6 +154,10 @@ function Write-State($state) {
 }
 
 $lastTitle = ''
+$lastCoverKey = ''
+$currentCoverPath = ''
+$lastCommandId = ''
+$controlResult = $null
 $lastProcess = $null
 $lastIoBytes = 0
 $lastIoTime = Get-Date
@@ -171,6 +180,10 @@ while ($true) {
         process        = $null
         io_rate_kbps   = $null
         cover_updated  = $false
+        cover_path     = ''
+        can_play_pause = $false
+        can_seek       = $false
+        control_result = $controlResult
     }
 
     if ($meterReady) {
@@ -184,6 +197,29 @@ while ($true) {
     $session = Get-SodaSession
     if ($session) {
         try {
+            if ($CommandPath -and (Test-Path -LiteralPath $CommandPath)) {
+                try {
+                    # Claim the file atomically so a restart cannot replay a click.
+                    Move-Item -LiteralPath $CommandPath -Destination ($CommandPath + '.pending') -Force -ErrorAction Stop
+                    $command = Get-Content -LiteralPath ($CommandPath + '.pending') -Raw -Encoding UTF8 | ConvertFrom-Json
+                    Remove-Item -LiteralPath ($CommandPath + '.pending') -Force
+                    if ($command.id -and $command.id -ne $lastCommandId) {
+                        $lastCommandId = $command.id
+                        $age = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0) - $command.issued_at
+                        if ($age -ge 0 -and $age -lt 5) {
+                            $success = switch ($command.action) {
+                                'play_pause' { Await ($session.TryTogglePlayPauseAsync()) ([bool]) }
+                                'next' { Await ($session.TrySkipNextAsync()) ([bool]) }
+                                'previous' { Await ($session.TrySkipPreviousAsync()) ([bool]) }
+                                'seek' { Await ($session.TryChangePlaybackPositionAsync([long]($command.position * 10000000))) ([bool]) }
+                            }
+                            $controlResult = @{ id = $command.id; success = [bool]$success }
+                        }
+                    }
+                }
+                catch { $controlResult = @{ id = $lastCommandId; success = $false } }
+                $state.control_result = $controlResult
+            }
             $props = Await ($session.TryGetMediaPropertiesAsync()) $smtcType
             $timeline = $session.GetTimelineProperties()
             $info = $session.GetPlaybackInfo()
@@ -196,19 +232,33 @@ while ($true) {
             $state.duration = [math]::Round($timeline.EndTime.TotalSeconds, 2)
             $state.can_next = [bool]$info.Controls.IsNextEnabled
             $state.can_prev = [bool]$info.Controls.IsPreviousEnabled
+            $state.can_play_pause = [bool]($info.Controls.IsPlayEnabled -or $info.Controls.IsPauseEnabled)
+            $state.can_seek = [bool]$info.Controls.IsPlaybackPositionEnabled
             $state.app_id = [string]$session.SourceAppUserModelId
 
-            if ($CoverPath -and $state.title -and $state.title -ne $lastTitle -and $props.Thumbnail) {
+            $coverKey = $state.title + "`n" + $state.artist
+            if ($coverKey -ne $lastCoverKey) { $currentCoverPath = '' }
+            if ($CoverPath -and $state.title -and ($coverKey -ne $lastCoverKey -or -not $currentCoverPath) -and $props.Thumbnail) {
                 try {
                     $ras = Await ($props.Thumbnail.OpenReadAsync()) $rasType
-                    $stream = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($ras)
-                    $out = [System.IO.File]::Create($CoverPath)
-                    $stream.CopyTo($out)
-                    $out.Close(); $stream.Close()
+                    # WinRT returns a COM proxy. Invoke its declared interface
+                    # explicitly; PowerShell cannot infer AsStreamForRead's overload.
+                    $input = $randomStreamType.GetMethod('GetInputStreamAt').Invoke($ras, @([uint64]0))
+                    $stream = $inputToStream.Invoke($null, @($input))
+                    $sha = [Security.Cryptography.SHA256]::Create()
+                    $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($coverKey))).Replace('-', '').Substring(0, 20)
+                    $sha.Dispose()
+                    $target = Join-Path (Split-Path $CoverPath) ("cover-" + $hash + '.png')
+                    $out = [System.IO.File]::Create($target + '.tmp')
+                    try { $stream.CopyTo($out) } finally { $out.Dispose(); $stream.Dispose() }
+                    Move-Item -LiteralPath ($target + '.tmp') -Destination $target -Force
+                    $currentCoverPath = $target
+                    $lastCoverKey = $coverKey
                     $state.cover_updated = $true
                 }
                 catch { }
             }
+            $state.cover_path = $currentCoverPath
             $lastTitle = $state.title
         }
         catch { }

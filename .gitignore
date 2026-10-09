@@ -19,3 +19,7 @@ desktop.ini
 _tmp.png
 _full*.png
 _now.png
+_cover*_qa.png
+
+# 本地界面校验日志
+_ui_runtime.log
